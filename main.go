@@ -1,119 +1,110 @@
 package main
 
 import (
-	"bytes"
-	"compress/zlib"
-	"encoding/base64"
-	"errors"
-	"io/ioutil"
-	"log"
+	"context"
 	"os"
+	"os/signal"
 	"strings"
+	"syscall"
 
 	tgbotapi "github.com/go-telegram-bot-api/telegram-bot-api/v5"
+	"github.com/rs/zerolog"
+	"github.com/rs/zerolog/log"
+)
+
+const (
+	cfgKrokiUrl = "https://kroki.io/graphviz"
+)
+
+var (
+	cfgLevel    = os.Getenv("LOG_LEVEL")
+	cfgBotToken = os.Getenv("BOT_TOKEN")
+	cfgFilesDir = os.Getenv("BOT_DIR")
 )
 
 func main() {
-	bot, err := tgbotapi.NewBotAPI(os.Getenv("BOT_TOKEN"))
+	log.Info().Msg("Starting bot")
+
+	if level, e := zerolog.ParseLevel(cfgLevel); e == nil {
+		zerolog.SetGlobalLevel(level)
+	}
+
+	if cfgFilesDir == "" {
+		log.Fatal().Msg("empty files directory path")
+	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	retChan := make(chan error, 1)
+
+	go func() {
+		err2 := loop(ctx, cfgBotToken)
+		if err2 != nil {
+			retChan <- err2
+		}
+		close(retChan)
+	}()
+
+	// Waiting signals from OS
+	go func() {
+		quit := make(chan os.Signal, 10)
+		signal.Notify(quit, syscall.SIGTERM, syscall.SIGINT)
+		log.Warn().Msgf("Signal '%s' was caught. Exiting", <-quit)
+		cancel()
+	}()
+
+	// Listening for the main loop response
+	for e := range retChan {
+		log.Info().Err(e).Msg("Exiting.")
+	}
+}
+
+func loop(ctx context.Context, token string) error {
+	bot, err := tgbotapi.NewBotAPI(token)
 	if err != nil {
-		log.Panic(err)
+		log.Fatal().Err(err)
 	}
 
-	filesdir := os.Getenv("BOT_DIR")
-	if filesdir == "" {
-		log.Panic(errors.New("empty directory path"))
-	}
+	bot.Debug = false
 
-	bot.Debug = true
-
-	log.Printf("Authorized on account %s", bot.Self.UserName)
+	log.Info().Msgf("Authorized on account %s", bot.Self.UserName)
 
 	u := tgbotapi.NewUpdate(0)
 	u.Timeout = 60
 
 	updates := bot.GetUpdatesChan(u)
 
-	proceeding := false
-	shutdown := false
-
-	for update := range updates {
-		if update.Message != nil { // If we got a message
-			log.Printf("[%s] %s", update.Message.From.UserName, update.Message.Text)
-
-			if shutdown {
-				msg := tgbotapi.NewMessage(update.Message.Chat.ID, "Bot is not available now. Check it tommorow")
-				msg.ReplyToMessageID = update.Message.MessageID
-				bot.Send(msg)
-			} else {
-				proceeding = true
-
-				if strings.HasPrefix(update.Message.Text, "/kroki") {
-					// planttxt := strings.Split(update.Message.Text, "/kroki ")[1]
-					// encoded, err := encode(planttxt)
-					// if err != nil {
-					// 	msg := tgbotapi.NewMessage(update.Message.Chat.ID, "Can not encode given plantUML")
-					// 	msg.ReplyToMessageID = update.Message.MessageID
-					// 	bot.Send(msg)
-					// } else {
-					// 	res, err := http.Get("https://kroki.io/graphviz/svg/" + encoded)
-					// 	if err != nil {
-					// 		fmt.Printf("error making http request: %s\n", err)
-					// 		msg := tgbotapi.NewMessage(update.Message.Chat.ID, "Can not encode given plantUML")
-					// 		msg.ReplyToMessageID = update.Message.MessageID
-					// 		bot.Send(msg)
-					// 	}
-					// }
-					msg := tgbotapi.NewMessage(update.Message.Chat.ID, "Command is under constructions")
-					msg.ReplyToMessageID = update.Message.MessageID
-					bot.Send(msg)
-				} else if strings.HasPrefix(update.Message.Text, "/read") {
-					filename := strings.Split(update.Message.Text, "/read ")[1]
-
-					if _, err := os.Stat(filesdir + filename); errors.Is(err, os.ErrNotExist) {
-						msg := tgbotapi.NewMessage(update.Message.Chat.ID, "No such file")
-						msg.ReplyToMessageID = update.Message.MessageID
-						bot.Send(msg)
-					} else {
-						content, err := ioutil.ReadFile(filesdir + filename)
-
-						if err != nil {
-							msg := tgbotapi.NewMessage(update.Message.Chat.ID, "Something went wrong")
-							msg.ReplyToMessageID = update.Message.MessageID
-							bot.Send(msg)
-
-						} else {
-							msg := tgbotapi.NewMessage(update.Message.Chat.ID, string(content))
-							msg.ReplyToMessageID = update.Message.MessageID
-							bot.Send(msg)
-						}
-					}
-				} else if strings.HasPrefix(update.Message.Text, "/exit") {
-					shutdown = true
-					msg := tgbotapi.NewMessage(update.Message.Chat.ID, "Bot is going home")
-					msg.ReplyToMessageID = update.Message.MessageID
-					bot.Send(msg)
-				}
-				proceeding = false
-			}
-			if shutdown && !proceeding {
-				break
-			}
+	for {
+		select {
+		case <-ctx.Done():
+			log.Info().Msg("Bye!")
+			return ctx.Err()
+		case update := <-updates:
+			go processUpdate(bot, update)
 		}
 	}
 }
 
-// Encode takes a string and returns an encoded string in deflate + base64 format
-func encode(input string) (string, error) {
-	var buffer bytes.Buffer
-	writer, err := zlib.NewWriterLevel(&buffer, 9)
-	if err != nil {
-		return "", errors.Join(err, errors.New("fail to create the writer"))
+func processUpdate(bot *tgbotapi.BotAPI, update tgbotapi.Update) {
+	var inputmsg *tgbotapi.Message
+
+	switch {
+	case update.Message != nil:
+		inputmsg = update.Message
+	case update.EditedMessage != nil:
+		inputmsg = update.EditedMessage
 	}
-	_, err = writer.Write([]byte(input))
-	writer.Close()
-	if err != nil {
-		return "", errors.Join(err, errors.New("fail to create the payload"))
+
+	if inputmsg != nil {
+		log.Info().Msgf("[%s] %s", inputmsg.From.UserName, inputmsg.Text)
+
+		switch {
+		case strings.HasPrefix(inputmsg.Text, "/kroki"):
+			ProcessKroki(bot, inputmsg)
+		case strings.HasPrefix(inputmsg.Text, "/read"):
+			ProcessRead(bot, inputmsg)
+		}
+
 	}
-	result := base64.URLEncoding.EncodeToString(buffer.Bytes())
-	return result, nil
 }
