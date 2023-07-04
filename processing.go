@@ -16,8 +16,15 @@ import (
 
 func ProcessRead(bot *tgbotapi.BotAPI, inputmsg *tgbotapi.Message) {
 	_, cmd, _ := strings.Cut(inputmsg.Text, "/read ")
-	_, filename, _ := strings.Cut(cmd, "@"+bot.Self.UserName+" ")
-	fullpath := cfgFilesDir + "/" + filename
+
+	var fullpath string
+	if before, after, found := strings.Cut(cmd, "@"+bot.Self.UserName+" "); found {
+		fullpath = cfgFilesDir + "/" + after
+	} else {
+		fullpath = cfgFilesDir + "/" + before
+	}
+
+	log.Info().Msgf("Path to file: %s", fullpath)
 
 	if _, err := os.Stat(fullpath); errors.Is(err, os.ErrNotExist) {
 		msg := tgbotapi.NewMessage(inputmsg.Chat.ID, "No such file")
@@ -40,7 +47,16 @@ func ProcessRead(bot *tgbotapi.BotAPI, inputmsg *tgbotapi.Message) {
 
 func ProcessKroki(bot *tgbotapi.BotAPI, inputmsg *tgbotapi.Message) {
 	_, cmd, _ := strings.Cut(inputmsg.Text, "/kroki ")
-	_, planttxt, _ := strings.Cut(cmd, "@"+bot.Self.UserName+" ")
+
+	var planttxt string
+	if before, after, found := strings.Cut(cmd, "@"+bot.Self.UserName+" "); found {
+		planttxt = after
+	} else {
+		planttxt = before
+	}
+
+	log.Info().Msgf("PlanUML text: %s", planttxt)
+
 	encoded, err := encode(planttxt)
 	if err != nil {
 		msg := tgbotapi.NewMessage(inputmsg.Chat.ID, "Can not encode given plantUML")
